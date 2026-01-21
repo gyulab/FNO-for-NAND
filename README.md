@@ -1,12 +1,39 @@
-# FNO for NAND
+# FNO for NAND: AI-Powered Semiconductor Device Simulation with NVIDIA PhysicsNeMo
 
-This repository contains Neural Operator (FNO) based surrogate models for NAND Flash Memory device simulation. The project aims to accelerate TCAD simulations using Physics-Informed Neural Operators.
+> **Powered by NVIDIA PhysicsNeMo**
+> 
+> This project leverages the **NVIDIA PhysicsNeMo** framework to implement Fourier Neural Operators (FNO) for high-speed, physics-preserving surrogate modeling of AI-powered Ferroelectric NAND (FeNAND) devices. By utilizing NVIDIA's optimized operator implementations, we can achieve significant acceleration over traditional TCAD tools while maintaining physical accuracy.
 
-## Directory Structure
+## Overview
+
+The `FNO_for_NAND` project aims to accelerate semiconductor device modeling by replacing computationally expensive Technology Computer-Aided Design (TCAD) simulations with Physics-Informed Neural Operators (PINO).
+
+At the core of our approach is **NVIDIA PhysicsNeMo**, which provides the robust, differentiable, and GPU-accelerated spectral operators necessary to solve the complex PDEs governing device physics (Poisson, Continuity, and Charge Trap equations).
+
+## Key Features
+
+- **NVIDIA PhysicsNeMo Integration**:
+  - Utilizes `physicsnemo.models.fno.FNO` for highly efficient spectral convolutions.
+  - Leverages optimized FFT implementations for training on high-resolution physics fields.
+
+- **Physics-Informed Learning (PINO)**:
+  - Incorporates Sobolev (H1) losses to enforce physical constraints, such as ensuring the Electric Field correctly matches the gradient of the Electrostatic Potential.
+  - Implements physics-guided loss functions (`PhysicsGuidedLoss`) directly on top of PhysicsNeMo's outputs.
+
+- **High-Fidelity Surrogate Modeling**:
+  - Accurate prediction of **Electrostatic Potential**, **Electron Trapped Charge**, and **Current Density** profiles.
+  - Specialized high-resolution modeling for critical gate oxide regions.
+
+## Project Structure
 
 - **`2D-FeNAND/`**: 
-  - Contains code and data for **2D Ferroelectric NAND (FeNAND)** devices.
-  - Implements surrogate models for predicting Electrostatic Potential, Charge, and Current profiles.
+  - **Code**: Training scripts utilizing `physicsnemo` for 2D Ferroelectric NAND devices.
+  - **Results**: Checkpoints and physics-informed animations.
+  - **Docs**: `FeNAND-AI-Surrogate.pdf` detailing the methodology.
   
 - **`3D-SONOS-NAND/`**:
-  - Placeholder for future work on **3D SONOS NAND** flash memory.
+  - Future development for 3D SONOS NAND architectures, scaling the PhysicsNeMo approach to 3D domains.
+
+## References
+
+- **NVIDIA PhysicsNeMo**: [https://github.com/ NVIDIA/PhysicsNeMo](https://github.com/NVIDIA/PhysicsNeMo) 
