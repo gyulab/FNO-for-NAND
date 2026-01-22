@@ -32,7 +32,10 @@ At the core of our approach is **NVIDIA PhysicsNeMo**, which provides the robust
   - **Docs**: `FeNAND-AI-Surrogate.pdf` detailing the methodology.
   
 - **`3D-SONOS-NAND/`**:
-  - Future development for 3D SONOS NAND architectures, scaling the PhysicsNeMo approach to 3D domains.
+  - **Code**: FNO-based surrogate model for predicting defect charge density in 3D SONOS (Silicon-Oxide-Nitride-Oxide-Silicon) NAND flash memory.
+  - **Features**: Multi-parameter inference (spacing, tunnel layer thickness, program voltage, time), design optimization, and visualization tools.
+  - **Data**: Training data from Ginestra TCAD simulations (hidden due to EULA/NDA).
+  - **Results**: Trained model checkpoints, parameter sweep animations, and optimal device configurations.
 
 ## References
 
