@@ -17,8 +17,8 @@ At the core of our approach is **NVIDIA PhysicsNeMo**, which provides the robust
   - Leverages optimized FFT implementations for training on high-resolution physics fields.
 
 - **Physics-Informed Learning (PINO)**:
-  - Incorporates Sobolev (H1) losses to enforce physical constraints, such as ensuring the Electric Field correctly matches the gradient of the Electrostatic Potential.
-  - Implements physics-guided loss functions (`PhysicsGuidedLoss`) directly on top of PhysicsNeMo's outputs.
+  - Enforces the **Poisson Equation** (`ε∇²φ + ρ = 0`) directly within the training loop.
+  - Uses **Finite Difference Methods (FDM)** implemented as differentiable convolutions in PyTorch to compute gradients and Laplacians ($\nabla^2\phi$) on the fly, minimizing the PDE residual alongside data loss.
 
 - **High-Fidelity Surrogate Modeling**:
   - Accurate prediction of **Electrostatic Potential**, **Electron Trapped Charge**, and **Current Density** profiles.
