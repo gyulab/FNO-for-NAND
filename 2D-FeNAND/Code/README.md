@@ -22,12 +22,23 @@ Standard FNO training using MSE Loss.
   ```
 
 #### `train_pino.py`
-Physics-Informed Neural Operator (PINO) training.
-- **Features**: Adds a Physics-Guided Loss (H1 Sobolev Loss) to enforce that the Electric Field matches the gradient of the Potential.
-- **Arguments**: `--lambda_phys` controls the weight of the physics loss.
+Physics-Informed Neural Operator (PINO) training that explicitly enforces the **Poisson Equation**.
+
+**Methodology**:
+The model output is constrained by a custom `Poisson` PDE module that calculates residuals within the computational graph:
+1. **Un-normalization**: Model outputs (Potential $\phi$, Charge $\rho$) are converted back to physical units.
+2. **Finite Difference Calculation**: The Laplacian of the potential $\nabla^2\phi$ is computed using fixed 3x3 finite difference kernels (convolutions).
+3. **Residual Computation**: The PDE residual $r$ is calculated as:
+   $$ r = \epsilon \nabla^2\phi + \rho $$
+   *(Where $\epsilon$ is the permittivity and $\rho$ is the charge density)* used as a regulariation term.
+4. **Boundary Masking**: Boundary pixels are masked out to avoid padding artifacts.
+
+- **Arguments**:
+  - `--lambda_phys`: Weight of the PDE residual loss (default: 0.1).
+  - `--epochs`: Default 500 (increased for convergence).
 - **Usage**:
   ```bash
-  python train_pino.py --lambda_phys 0.1
+  python train_pino.py --lambda_phys 0.1 --epochs 500
   ```
 
 #### `train_eTrappedCharge.py`
