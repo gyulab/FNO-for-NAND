@@ -36,4 +36,5 @@ At the core of our approach is **NVIDIA PhysicsNeMo**, which provides the robust
 
 ## References
 
-- **NVIDIA PhysicsNeMo**: [https://github.com/ NVIDIA/PhysicsNeMo](https://github.com/NVIDIA/PhysicsNeMo) 
+- **NVIDIA PhysicsNeMo**: [https://github.com/ NVIDIA/PhysicsNeMo](https://github.com/NVIDIA/PhysicsNeMo)
+- **Read my Blog post**: [https://gyulab.github.io/pino/](https://gyulab.github.io/pino/)
