@@ -1,252 +1,222 @@
 import os
 import argparse
 import numpy as np
+import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 from scipy.optimize import differential_evolution
 from physicsnemo.models.fno import FNO
 
 # ==========================================
-# 1. Integration & Physics Logic
+# 1. Physics & Integration Logic
 # ==========================================
-def integrate_cylindrical_charge(dcd_map, x_grid, r_grid, x_bounds):
-    """
-    Integrates charge density over a cylindrical volume.
-    Q = integral( rho(x,r) * 2*pi*r * dr * dx )
-    
-    Args:
-        dcd_map: (H, W) array of defect charge density [C/cm^3]
-        x_grid: (H, W) array of X coordinates [cm]
-        r_grid: (H, W) array of R coordinates [cm]
-        x_bounds: Tuple (x_min, x_max) defining the region to integrate over [cm]
-    """
-    # Create mask for the region of interest (e.g., CC, LC, RC)
-    mask = (x_grid >= x_bounds[0]) & (x_grid <= x_bounds[1])
-    
-    if not np.any(mask):
-        return 0.0
-
-    # Differential Elements (assuming uniform grid for simplicity)
-    # dx = total_x_width / W
-    # dr = total_r_height / H
-    # Note: dcd_map is HxW (rows=R, cols=X)
-    
-    H, W = dcd_map.shape
-    dx = np.abs(x_grid[0, 1] - x_grid[0, 0])
-    dr = np.abs(r_grid[1, 0] - r_grid[0, 0])
-    
-    # Volume Element dV = 2 * pi * r * dr * dx
-    # We use r_grid for 'r'
-    dV = 2 * np.pi * r_grid * dr * dx
-    
-    # Total Charge in region
-    # Q = sum( rho * dV * mask )
-    total_charge = np.sum(dcd_map * dV * mask)
-    
-    return total_charge
-
 class LCMOptimizer:
     def __init__(self, checkpoint_dir, alpha=1.0, beta=1.0, gate_length_nm=30.0):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.alpha = alpha
         self.beta = beta
-        self.gate_len_cm = gate_length_nm * 1e-7 # nm to cm
+        self.gate_len_cm = gate_length_nm * 1e-7
         
-        # Load Stats
+        # Load Stats & Model
         stats_path = os.path.join(checkpoint_dir, "stats.pt")
+        model_path = os.path.join(checkpoint_dir, "best_model.pth")
+        
         try:
             self.stats = torch.load(stats_path, weights_only=False)
+            self.model_state = torch.load(model_path, map_location=self.device, weights_only=False)
         except TypeError:
             self.stats = torch.load(stats_path)
-            
-        # Load Model
+            self.model_state = torch.load(model_path, map_location=self.device)
+
         self.model = FNO(in_channels=6, out_channels=1, decoder_layers=1, 
                          decoder_layer_size=32, dimension=2, latent_channels=32, 
                          num_fno_layers=4, num_fno_modes=12, padding=8).to(self.device)
-        
-        model_path = os.path.join(checkpoint_dir, "best_model.pth")
-        try:
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device, weights_only=False))
-        except TypeError:
-            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model.load_state_dict(self.model_state)
         self.model.eval()
         
-        # Pre-allocate grid tensors for speed
+        # Pre-compute normalized coordinate grids (H, W) = (64, 128)
         self.H, self.W = 64, 128
         self.grid_x_norm, self.grid_r_norm = np.meshgrid(
             np.linspace(-1, 1, self.W), np.linspace(0, 1, self.H)
         )
+        self.grid_x_norm = torch.from_numpy(self.grid_x_norm).float().to(self.device)
+        self.grid_r_norm = torch.from_numpy(self.grid_r_norm).float().to(self.device)
 
-    def predict_map(self, spacing, tl, pgm, time):
-        """Runs FNO Inference for a single parameter set."""
-        # 1. Normalize Inputs
-        log_time = np.log10(time + 1e-6) if time > 0 else 0
-        raw_params = np.array([spacing, tl, pgm, log_time])
-        norm_params = (raw_params - self.stats['p_mean']) / self.stats['p_std']
-        
-        # 2. Build Input Tensor
-        x_input = np.zeros((1, 6, self.H, self.W), dtype=np.float32)
-        for c in range(4):
-            x_input[0, c, :, :] = norm_params[c]
-            
-        x_input[0, 4, :, :] = self.grid_x_norm
-        x_input[0, 5, :, :] = self.grid_r_norm
-        
-        x_tensor = torch.from_numpy(x_input).to(self.device)
-        
-        # 3. Predict & Denormalize
-        with torch.no_grad():
-            pred = self.model(x_tensor)
-        
-        pred_real = (pred.cpu().numpy().squeeze() * self.stats['dcd_std']) + self.stats['dcd_mean']
-        return pred_real
-
-    def objective_function(self, x):
-        """
-        The Cost Function to Minimize.
-        x = [Spacing (nm), TL (A), PGM (V)]
-        """
+    def predict_and_loss(self, x):
         spacing, tl, pgm = x
         
-        # 1. Predict Maps at t=0 and t=10000
-        map_0 = self.predict_map(spacing, tl, pgm, time=0.0)
-        map_t = self.predict_map(spacing, tl, pgm, time=10000.0)
+        # --- Batch Prediction (t=0 and t=10000) ---
+        # Params T=0
+        log_time_0 = 0.0
+        p0 = np.array([spacing, tl, pgm, log_time_0])
+        p0_norm = (p0 - self.stats['p_mean']) / self.stats['p_std']
         
-        # 2. Define Physical Grid (Dynamic based on Spacing/TL)
-        # X Range: +/- 4.0 * Spacing (nm -> cm)
+        # Params T=10000
+        log_time_t = np.log10(10000.0)
+        pt = np.array([spacing, tl, pgm, log_time_t])
+        pt_norm = (pt - self.stats['p_mean']) / self.stats['p_std']
+        
+        # Prepare Batch Input: (2, 6, H, W)
+        batch_input = torch.zeros((2, 6, self.H, self.W), device=self.device)
+        
+        # Broadcast scalar params
+        for i, p_norm in enumerate([p0_norm, pt_norm]):
+            for c in range(4):
+                batch_input[i, c, :, :] = float(p_norm[c])
+            batch_input[i, 4, :, :] = self.grid_x_norm
+            batch_input[i, 5, :, :] = self.grid_r_norm
+            
+        with torch.no_grad():
+            preds = self.model(batch_input) # Output (2, 1, H, W)
+            
+        # Denormalize
+        preds_real = (preds.squeeze().cpu().numpy() * self.stats['dcd_std']) + self.stats['dcd_mean']
+        map_0, map_t = preds_real[0], preds_real[1]
+        
+        # --- Integration ---
+        # Physical Grids [cm]
         x_half_cm = (4.0 * spacing) * 1e-7
-        # R Range: TL to TL+13nm (A -> cm)
         r_start_cm = (tl * 1e-8)
         r_width_cm = 13.0 * 1e-7
         
-        # Create Physical Meshgrid [cm] for integration
-        phys_x = np.linspace(-x_half_cm, x_half_cm, self.W)
-        phys_r = np.linspace(r_start_cm, r_start_cm + r_width_cm, self.H)
-        grid_x_cm, grid_r_cm = np.meshgrid(phys_x, phys_r)
+        # Differential elements
+        dx = (2 * x_half_cm) / self.W
+        dr = r_width_cm / self.H
         
-        # 3. Define Zones Bounds [cm]
-        # CC: Center Cell (-Lg/2 to Lg/2)
-        cc_bounds = (-self.gate_len_cm/2, self.gate_len_cm/2)
-        # LC: Left Cell ( -Infinity to -Lg/2 )
-        lc_bounds = (-999.0, -self.gate_len_cm/2)
-        # RC: Right Cell ( Lg/2 to Infinity )
-        rc_bounds = (self.gate_len_cm/2, 999.0)
+        # R vector for volume element (H,)
+        r_vec = np.linspace(r_start_cm, r_start_cm + r_width_cm, self.H)
+        # Volume factor per row: 2 * pi * r * dr * dx
+        # Shape (H, 1) to broadcast across W
+        vol_factor = (2 * np.pi * r_vec * dr * dx)[:, None]
         
-        # 4. Integrate Charges
-        # Q(0)
-        q_cc_0 = integrate_cylindrical_charge(map_0, grid_x_cm, grid_r_cm, cc_bounds)
-        q_lc_0 = integrate_cylindrical_charge(map_0, grid_x_cm, grid_r_cm, lc_bounds)
-        q_rc_0 = integrate_cylindrical_charge(map_0, grid_x_cm, grid_r_cm, rc_bounds)
+        # Zone Masks (Indices)
+        x_vec = np.linspace(-x_half_cm, x_half_cm, self.W)
+        cc_mask = (x_vec >= -self.gate_len_cm/2) & (x_vec <= self.gate_len_cm/2)
+        lc_mask = (x_vec < -self.gate_len_cm/2)
+        rc_mask = (x_vec > self.gate_len_cm/2)
         
-        # Q(t)
-        q_cc_t = integrate_cylindrical_charge(map_t, grid_x_cm, grid_r_cm, cc_bounds)
-        q_lc_t = integrate_cylindrical_charge(map_t, grid_x_cm, grid_r_cm, lc_bounds)
-        q_rc_t = integrate_cylindrical_charge(map_t, grid_x_cm, grid_r_cm, rc_bounds)
+        # Helper to sum charge
+        def get_q(map_arr, mask):
+            # Sum( Rho * VolFactor ) only where mask is True
+            # map_arr is (H, W), vol_factor is (H, 1), mask is (W,)
+            return np.sum(map_arr[:, mask] * vol_factor)
+
+        # Compute Delta Q
+        dq_cc = (get_q(map_t, cc_mask) - get_q(map_0, cc_mask))/spacing
+        dq_lc = (get_q(map_t, lc_mask) - get_q(map_0, lc_mask))/spacing
+        dq_rc = (get_q(map_t, rc_mask) - get_q(map_0, rc_mask))/spacing
         
-        # 5. Compute Deltas (Retention Loss)
-        dq_cc = q_cc_t - q_cc_0
-        dq_lc = q_lc_t - q_lc_0
-        dq_rc = q_rc_t - q_rc_0
-        
-        # 6. Composite Objective F
-        # F = alpha * |dQ_CC| + beta * max(|dQ_LC|, |dQ_RC|)
-        # We want to minimize the magnitude of charge loss/gain
-        loss = self.alpha * np.abs(dq_cc) + self.beta * max(np.abs(dq_lc), np.abs(dq_rc))
-        
+        # Objective
+        loss = self.alpha * np.abs(dq_cc) + self.beta * (np.abs(dq_lc) + np.abs(dq_rc))
         return loss
 
+# ==========================================
+# 2. Main Execution
+# ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="Optimize SONOS Parameters for Minimal LCM")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints")
-    parser.add_argument("--alpha", type=float, default=1.0, help="Weight for Center Cell Loss")
-    parser.add_argument("--beta", type=float, default=1.0, help="Weight for Lateral Migration")
-    parser.add_argument("--gate_len", type=float, default=30.0, help="Gate Length in nm (defines CC zone)")
     args = parser.parse_args()
     
-    optimizer_engine = LCMOptimizer(args.checkpoint_dir, args.alpha, args.beta, args.gate_len)
+    optimizer_engine = LCMOptimizer(args.checkpoint_dir)
     
-    # ==========================================
-    # Optimization Setup
-    # ==========================================
-    # Bounds based on training data range + interpolation safety
-    # Spacing: 20nm to 30nm
-    # TL: 20A to 40A
-    # PGM: 10V to 20V
-    bounds = [
-        (20.0, 30.0), # Spacing
-        (20.0, 40.0), # TL
-        (10.0, 20.0)  # PGM
-    ]
+    # Storage for all candidates
+    # Columns: [Spacing, TL, PGM, Loss, Iteration]
+    history = []
     
-    print("==================================================")
-    print("Starting Differential Evolution Optimization")
-    print(f"Objective: Minimize F = {args.alpha}*|dQ_CC| + {args.beta}*max(|dQ_LC|,|dQ_RC|)")
-    print(f"Time: 10,000s | Gate Length: {args.gate_len}nm")
-    print(f"Search Space: Spacing[20-30nm], TL[20-40A], PGM[10-20V]")
-    print("==================================================")
-
-    # Run Differential Evolution
+    # Bounds
+    bounds = [(20.0, 30.0), (20.0, 40.0), (10.0, 20.0)]
+    
+    # --- Wrapper to log every call ---
+    # Differential Evolution calls this function for every candidate
+    def obj_wrapper(x):
+        loss = optimizer_engine.predict_and_loss(x)
+        # We append a placeholder iteration 0; we will fix iterations via callback
+        history.append([x[0], x[1], x[2], loss])
+        return loss
+    
+    # --- Callback to print progress ---
+    # Called after each population evolves
+    current_iter = [0]
+    def callback(xk, convergence):
+        current_iter[0] += 1
+        # Calculate loss for best candidate xk
+        best_loss = optimizer_engine.predict_and_loss(xk)
+        print(f"Step {current_iter[0]}: Best F={best_loss:.4e} | Params: S={xk[0]:.2f}, TL={xk[1]:.2f}, PGM={xk[2]:.2f}")
+    
+    print("Running optimization with history logging...")
+    
     result = differential_evolution(
-        optimizer_engine.objective_function, 
-        bounds, 
-        strategy='best1bin', 
-        maxiter=50, 
-        popsize=15, 
+        obj_wrapper,
+        bounds,
+        strategy='best1bin',
+        maxiter=30,
+        popsize=10, 
+        callback=callback,
         tol=0.01,
-        mutation=(0.5, 1), 
-        recombination=0.7,
-        disp=True # Print convergence messages
+        disp=False
     )
     
-    print("\nOptimization Complete!")
-    print(f"Success: {result.success}")
-    print(f"Message: {result.message}")
-    print("--------------------------------------------------")
-    print(f"Minimum Objective F: {result.fun:.4e} Coulombs")
-    print("Optimal Parameters:")
-    print(f"  Spacing : {result.x[0]:.4f} nm")
-    print(f"  TL      : {result.x[1]:.4f} A")
-    print(f"  PGM     : {result.x[2]:.4f} V")
-    print("--------------------------------------------------")
-    
     # ==========================================
-    # Verification & Plotting
+    # 3. Visualization
     # ==========================================
-    print("Verifying optimal solution...")
-    # Re-calculate final metrics for display
-    opt_x = result.x
-    opt_spacing, opt_tl, opt_pgm = opt_x
+    df = pd.DataFrame(history, columns=["Spacing", "TL", "PGM", "Loss"])
     
-    # Hack to print the specific components
-    # We call objective_function but we'd need to modify it to return components.
-    # Instead, we just re-run the prediction code briefly here for plotting.
-    map_t = optimizer_engine.predict_map(opt_spacing, opt_tl, opt_pgm, 10000.0)
+    # Sort by Loss to see the "best" candidates clearly
+    df_sorted = df.sort_values("Loss")
+    best_candidates = df_sorted.head(100) # Top 100 points tried
     
-    # Plot Optimal Map
-    H, W = 64, 128
-    x_half = 4.0 * opt_spacing
-    tl_nm = opt_tl * 0.1
+    print("\nTop 5 Candidates Found:")
+    print(df_sorted.head(5))
     
-    phys_x = np.linspace(-x_half, x_half, W)
-    phys_r = np.linspace(tl_nm, tl_nm+13.0, H)
-    X, R = np.meshgrid(phys_x, phys_r)
+    # --- Plot 1: Parameter Correlation with Loss ---
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     
-    plt.figure(figsize=(10, 5))
-    c = plt.contourf(X, R, map_t, levels=60, cmap='seismic')
-    cbar = plt.colorbar(c)
-    cbar.set_label('Defect Charge Density ($C \cdot cm^{-3}$)')
+    # Spacing vs Loss
+    sc1 = axes[0].scatter(df["Spacing"], df["Loss"], c=df["Loss"], cmap='viridis_r', alpha=0.6)
+    axes[0].set_xlabel("Spacing (nm)")
+    axes[0].set_ylabel("Objective F (Coulombs)")
+    axes[0].set_title("Spacing vs. Minimal F")
+    axes[0].grid(True, alpha=0.3)
     
-    # Draw Gate Boundaries
-    plt.axvline(args.gate_len/2, color='black', linestyle='--', linewidth=1.5, label='Gate Edge')
-    plt.axvline(-args.gate_len/2, color='black', linestyle='--', linewidth=1.5)
+    # TL vs Loss
+    sc2 = axes[1].scatter(df["TL"], df["Loss"], c=df["Loss"], cmap='viridis_r', alpha=0.6)
+    axes[1].set_xlabel("Tunnel Thickness (A)")
+    axes[1].set_title("Thickness vs. Minimal F")
+    axes[1].grid(True, alpha=0.3)
     
-    plt.title(f"OPTIMAL CONFIGURATION\nF={result.fun:.2e} | S={opt_spacing:.2f}nm, TL={opt_tl:.2f}A, PGM={opt_pgm:.2f}V")
-    plt.xlabel('Axial Position X (nm)')
-    plt.ylabel('Radius R (nm)')
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("optimal_lcm_solution.png")
-    print("Saved optimal_lcm_solution.png")
+    # PGM vs Loss
+    sc3 = axes[2].scatter(df["PGM"], df["Loss"], c=df["Loss"], cmap='viridis_r', alpha=0.6)
+    axes[2].set_xlabel("Program Voltage (V)")
+    axes[2].set_title("PGM vs. Minimal F")
+    axes[2].grid(True, alpha=0.3)
+    
+    cbar = plt.colorbar(sc3, ax=axes.ravel().tolist())
+    cbar.set_label('Composite Objective F')
+    
+    plt.suptitle("Optimization Search Landscape: Trends for Minimal LCM", fontsize=16)
+    plt.savefig("optimization_trends.png")
+    print("Saved trend plot to optimization_trends.png")
+    
+    # --- Plot 2: 3D Best Trajectory ---
+    # Plot the parameters of the top 10% best solutions to see where they cluster
+    cutoff = df["Loss"].quantile(0.10)
+    best_cluster = df[df["Loss"] < cutoff]
+    
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    
+    p = ax.scatter(best_cluster["Spacing"], best_cluster["TL"], best_cluster["PGM"], 
+                   c=best_cluster["Loss"], cmap='jet', s=50, depthshade=True)
+    
+    ax.set_xlabel('Spacing (nm)')
+    ax.set_ylabel('Thickness (A)')
+    ax.set_zlabel('PGM Voltage (V)')
+    ax.set_title(f'Cluster of Optimal Parameters (Top 10%)')
+    
+    fig.colorbar(p, label='Objective F')
+    plt.savefig("optimization_cluster_3d.png")
+    print("Saved 3D cluster plot to optimization_cluster_3d.png")
 
 if __name__ == "__main__":
     main()
